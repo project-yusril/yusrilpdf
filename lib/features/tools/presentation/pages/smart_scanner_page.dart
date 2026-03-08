@@ -3,7 +3,8 @@ import 'package:camera/camera.dart';
 import 'package:get/get.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../../../../core/constants/app_colors.dart';
-import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
+import '../../../../core/utils/document_detector.dart';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -29,8 +30,6 @@ class _SmartScannerPageState extends State<SmartScannerPage>
   bool _isReady = false;
 
   FlashMode _flashMode = FlashMode.off;
-  Rect? _targetRect;
-  Rect? _currentRect;
   Size? _imageSize;
 
   // --- Advanced Smart Logic Variables ---
@@ -42,7 +41,7 @@ class _SmartScannerPageState extends State<SmartScannerPage>
   Offset? _lastCenter;
   int _frameCount = 0;
 
-  ObjectDetector? _objectDetector;
+  List<math.Point<int>>? _currentCorners;
   bool _isBusy = false;
   final List<String> _capturedPaths = [];
 
@@ -63,12 +62,7 @@ class _SmartScannerPageState extends State<SmartScannerPage>
   }
 
   void _initializeDetector() {
-    final options = ObjectDetectorOptions(
-      mode: DetectionMode.stream,
-      classifyObjects: false,
-      multipleObjects: false,
-    );
-    _objectDetector = ObjectDetector(options: options);
+    // Custom DocumentDetector is static, no initialization needed for object
   }
 
   Future<void> _initializeCamera() async {
@@ -92,91 +86,128 @@ class _SmartScannerPageState extends State<SmartScannerPage>
 
   Future<void> _processCameraImage(CameraImage image) async {
     _frameCount++;
-    // Frame Throttling: Process every 3rd frame (~10 FPS)
-    if (_frameCount % 3 != 0) return;
+    if (_frameCount % 4 != 0)
+      return; // Process every 4th frame (increased from 5 for better 'Quick' feel)
 
-    if (_objectDetector == null || _isBusy) return;
+    if (_isBusy) return;
     _isBusy = true;
 
     try {
-      final inputImage = _inputImageFromCameraImage(image);
-      if (inputImage == null) return;
+      final img.Image? dartImage = _convertCameraImage(image);
+      if (dartImage == null) return;
 
-      final objects = await _objectDetector!.processImage(inputImage);
+      final corners = DocumentDetector.detectDocument(dartImage);
 
-      if (objects.isNotEmpty) {
-        final rect = objects.first.boundingBox;
-        final center =
-            Offset(rect.left + rect.width / 2, rect.top + rect.height / 2);
-
-        // Motion Detection: If center moves more than 5% of width, reset stability
+      if (corners != null) {
+        // Stability Logic: Check if corners moved significantly
         if (_lastCenter != null) {
-          final diff = (center - _lastCenter!).distance;
+          final currentCenter = _calculateCenter(corners);
+          final diff = (currentCenter - _lastCenter!).distance;
           if (diff > (image.width * 0.05)) {
             _stableFrames = 0;
           }
         }
-        _lastCenter = center;
+        _lastCenter = _calculateCenter(corners);
+        _imageSize =
+            Size(dartImage.width.toDouble(), dartImage.height.toDouble());
 
-        if (_targetRect == null) {
-          HapticFeedback.lightImpact();
-        }
         setState(() {
-          _targetRect = rect;
-          _currentRect = _currentRect == null
-              ? _targetRect
-              : Rect.fromLTRB(
-                  ui.lerpDouble(_currentRect!.left, _targetRect!.left, 0.2)!,
-                  ui.lerpDouble(_currentRect!.top, _targetRect!.top, 0.2)!,
-                  ui.lerpDouble(_currentRect!.right, _targetRect!.right, 0.2)!,
-                  ui.lerpDouble(
-                      _currentRect!.bottom, _targetRect!.bottom, 0.2)!,
-                );
-          _imageSize = Size(image.width.toDouble(), image.height.toDouble());
-
-          // --- Perspective & Shape Validation ---
-          final aspectRatio = rect.width / rect.height;
-          final area = rect.width * rect.height;
-          final minArea =
-              (image.width * image.height) * 0.15; // Min 15% of frame
-
-          bool isValidShape =
-              aspectRatio > 0.4 && aspectRatio < 2.5 && area > minArea;
-
-          if (isValidShape) {
-            _stableFrames++;
-            // Temporal Stability & Auto Capture
-            if (_stableFrames > 15) {
-              _statusMessage = "Siap! Jepret Otomatis...";
-              if (_isAutoCaptureEnabled && _canAutoCapture()) {
-                _autoTakePicture();
-              }
-            } else if (_stableFrames > 5) {
-              _statusMessage = "Tahan Sebentar...";
-            } else {
-              _statusMessage = "Dokumen Terdeteksi";
-            }
+          // Smoothing (lerp) for the 4 corners
+          if (_currentCorners == null || _currentCorners!.length != 4) {
+            _currentCorners = List.from(corners);
           } else {
-            _stableFrames = 0;
-            _statusMessage = "Dekati Dokumen...";
+            for (int i = 0; i < 4; i++) {
+              _currentCorners![i] = math.Point(
+                ui
+                    .lerpDouble(_currentCorners![i].x.toDouble(),
+                        corners[i].x.toDouble(), 0.3)!
+                    .toInt(),
+                ui
+                    .lerpDouble(_currentCorners![i].y.toDouble(),
+                        corners[i].y.toDouble(), 0.3)!
+                    .toInt(),
+              );
+            }
+          }
+
+          _stableFrames++;
+          if (_stableFrames > 12) {
+            _statusMessage = "Siap! Jepret Otomatis...";
+            if (_isAutoCaptureEnabled && _canAutoCapture()) {
+              _autoTakePicture();
+            }
+          } else if (_stableFrames > 4) {
+            _statusMessage = "Tahan Sebentar...";
+          } else {
+            _statusMessage = "Dokumen Terdeteksi";
           }
         });
       } else {
         _stableFrames = 0;
         _lastCenter = null;
         setState(() {
-          _targetRect = null;
-          _currentRect = null;
+          _currentCorners = null;
           _statusMessage = "Mencari Dokumen...";
         });
       }
 
-      // 4. Lighting Detection (Simple Y-plane average)
       _checkLighting(image);
     } catch (e) {
-      debugPrint('ML Kit error: $e');
+      debugPrint('Detection error: $e');
     } finally {
       _isBusy = false;
+    }
+  }
+
+  Offset _calculateCenter(List<math.Point<int>> corners) {
+    double x = 0;
+    double y = 0;
+    for (final p in corners) {
+      x += p.x;
+      y += p.y;
+    }
+    return Offset(x / 4, y / 4);
+  }
+
+  img.Image? _convertCameraImage(CameraImage image) {
+    try {
+      final int width = image.width;
+      final int height = image.height;
+      final img.Image dartImage = img.Image(width: width, height: height);
+
+      final Plane yPlane = image.planes[0];
+      final Plane uPlane = image.planes[1];
+      final Plane vPlane = image.planes[2];
+
+      final Uint8List yBytes = yPlane.bytes;
+      final Uint8List uBytes = uPlane.bytes;
+      final Uint8List vBytes = vPlane.bytes;
+
+      for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+          final int yIndex = y * yPlane.bytesPerRow + x * yPlane.bytesPerPixel!;
+          final int uvIndex =
+              (y ~/ 2) * uPlane.bytesPerRow + (x ~/ 2) * uPlane.bytesPerPixel!;
+
+          final int yValue = yBytes[yIndex];
+          final int uValue = uBytes[uvIndex] - 128;
+          final int vValue = vBytes[uvIndex] - 128;
+
+          int r = (yValue + 1.370705 * vValue).round();
+          int g = (yValue - 0.337633 * uValue - 0.698001 * vValue).round();
+          int b = (yValue + 1.732446 * uValue).round();
+
+          dartImage.setPixelRgb(
+              x, y, r.clamp(0, 255), g.clamp(0, 255), b.clamp(0, 255));
+        }
+      }
+
+      // Rotate image to match portrait screen orientation
+      // Most Android camera sensors are rotated 90 deg landscape
+      return img.copyRotate(dartImage, angle: 90);
+    } catch (e) {
+      debugPrint("Conversion error: $e");
+      return null;
     }
   }
 
@@ -212,7 +243,7 @@ class _SmartScannerPageState extends State<SmartScannerPage>
     try {
       final XFile file = await _controller!.takePicture();
       final processedPath =
-          await _processCapturedImage(file.path, _currentRect);
+          await _processCapturedImage(file.path, _currentCorners);
 
       if (!_isBatchMode) {
         Get.back(result: processedPath);
@@ -227,35 +258,40 @@ class _SmartScannerPageState extends State<SmartScannerPage>
     }
   }
 
-  Future<String> _processCapturedImage(String path, Rect? cropRect) async {
-    if (cropRect == null || _imageSize == null) return path;
+  Future<String> _processCapturedImage(
+      String path, List<math.Point<int>>? corners) async {
+    if (corners == null || _imageSize == null) return path;
 
     try {
       final bytes = await File(path).readAsBytes();
-      img.Image? image = img.decodeImage(bytes);
-      if (image == null) return path;
+      img.Image? capturedImage = img.decodeImage(bytes);
+      if (capturedImage == null) return path;
 
-      // Coordinate transformation
-      // ML Kit Rect is in camera resolution: imageSize.height (W) x imageSize.width (H)
-      // because the stream is usually landscape/rotated.
-      // But captured images are often already rotated.
+      // Coordinate transformation from stream resolution to captured image resolution
+      // The corners are in stream resolution (portrait after my manual rotation)
+      final double scaleX = capturedImage.width / _imageSize!.width;
+      final double scaleY = capturedImage.height / _imageSize!.height;
 
-      double scaleX = image.width / _imageSize!.height;
-      double scaleY = image.height / _imageSize!.width;
+      // Find bounding box for the 4 corners to perform crop
+      int minX = corners.map((p) => p.x).reduce(math.min);
+      int maxX = corners.map((p) => p.x).reduce(math.max);
+      int minY = corners.map((p) => p.y).reduce(math.min);
+      int maxY = corners.map((p) => p.y).reduce(math.max);
 
-      final int left = (cropRect.left * scaleX).toInt().clamp(0, image.width);
-      final int top = (cropRect.top * scaleY).toInt().clamp(0, image.height);
+      final int left = (minX * scaleX).toInt().clamp(0, capturedImage.width);
+      final int top = (minY * scaleY).toInt().clamp(0, capturedImage.height);
       final int width =
-          (cropRect.width * scaleX).toInt().clamp(0, image.width - left);
+          ((maxX - minX) * scaleX).toInt().clamp(0, capturedImage.width - left);
       final int height =
-          (cropRect.height * scaleY).toInt().clamp(0, image.height - top);
+          ((maxY - minY) * scaleY).toInt().clamp(0, capturedImage.height - top);
 
-      if (width > 10 && height > 10) {
-        final cropped =
-            img.copyCrop(image, x: left, y: top, width: width, height: height);
+      if (width > 100 && height > 100) {
+        // High quality crop
+        final cropped = img.copyCrop(capturedImage,
+            x: left, y: top, width: width, height: height);
 
         final tempDir = await getTemporaryDirectory();
-        final fileName = 'cropped_${DateTime.now().millisecondsSinceEpoch}.jpg';
+        final fileName = 'scan_${DateTime.now().millisecondsSinceEpoch}.jpg';
         final newPath = p.join(tempDir.path, fileName);
 
         await File(newPath).writeAsBytes(img.encodeJpg(cropped, quality: 90));
@@ -267,47 +303,9 @@ class _SmartScannerPageState extends State<SmartScannerPage>
     return path;
   }
 
-  InputImage? _inputImageFromCameraImage(CameraImage image) {
-    if (_controller == null) return null;
-
-    final sensorOrientation = _controller!.description.sensorOrientation;
-    final rotation = InputImageRotationValue.fromRawValue(sensorOrientation);
-    if (rotation == null) return null;
-
-    final format = InputImageFormatValue.fromRawValue(image.format.raw);
-    if (format == null ||
-        (format != InputImageFormat.yuv420 &&
-            format != InputImageFormat.nv21)) {
-      return null;
-    }
-
-    if (image.planes.length != 1 && format == InputImageFormat.nv21) {
-      return null;
-    }
-    if (image.planes.length != 3 && format == InputImageFormat.yuv420) {
-      return null;
-    }
-
-    final bytes = WriteBuffer();
-    for (final plane in image.planes) {
-      bytes.putUint8List(plane.bytes);
-    }
-
-    return InputImage.fromBytes(
-      bytes: bytes.done().buffer.asUint8List(),
-      metadata: InputImageMetadata(
-        size: Size(image.width.toDouble(), image.height.toDouble()),
-        rotation: rotation,
-        format: format,
-        bytesPerRow: image.planes[0].bytesPerRow,
-      ),
-    );
-  }
-
   @override
   void dispose() {
     _animationController.dispose();
-    _objectDetector?.close();
     _controller?.dispose();
     super.dispose();
   }
@@ -334,11 +332,11 @@ class _SmartScannerPageState extends State<SmartScannerPage>
           Positioned.fill(
             child: CustomPaint(
               painter: ScannerOverlayPainter(
-                detectedRect: _currentRect,
-                imageSize: _imageSize,
-                screenSize: MediaQuery.of(context).size,
                 scanLinePosition: _scanLinePosition,
+                corners: _currentCorners,
+                imageSize: _imageSize,
                 statusMessage: _statusMessage,
+                isLowLight: _isLowLight,
               ),
             ),
           ),
@@ -458,12 +456,30 @@ class _SmartScannerPageState extends State<SmartScannerPage>
                     _ModeButton(
                       label: 'Satu Halaman',
                       isSelected: !_isBatchMode,
-                      onTap: () => setState(() => _isBatchMode = false),
+                      onTap: () {
+                        if (_isBatchMode) {
+                          setState(() {
+                            _isBatchMode = false;
+                            _stableFrames = 0;
+                            _currentCorners = null;
+                            _statusMessage = "Mode Satu Halaman";
+                          });
+                        }
+                      },
                     ),
                     _ModeButton(
                       label: 'Batch',
                       isSelected: _isBatchMode,
-                      onTap: () => setState(() => _isBatchMode = true),
+                      onTap: () {
+                        if (!_isBatchMode) {
+                          setState(() {
+                            _isBatchMode = true;
+                            _stableFrames = 0;
+                            _currentCorners = null;
+                            _statusMessage = "Mode Batch Aktif";
+                          });
+                        }
+                      },
                     ),
                   ],
                 ),
@@ -519,7 +535,7 @@ class _SmartScannerPageState extends State<SmartScannerPage>
                           try {
                             final XFile file = await _controller!.takePicture();
                             final processedPath = await _processCapturedImage(
-                                file.path, _currentRect);
+                                file.path, _currentCorners);
 
                             if (!_isBatchMode) {
                               Get.back(result: processedPath);
@@ -696,23 +712,23 @@ class _ActionItem extends StatelessWidget {
 }
 
 class ScannerOverlayPainter extends CustomPainter {
-  final Rect? detectedRect;
+  final List<math.Point<int>>? corners;
   final Size? imageSize;
-  final Size screenSize;
   final double scanLinePosition;
   final String statusMessage;
+  final bool isLowLight;
 
   ScannerOverlayPainter({
-    this.detectedRect,
+    this.corners,
     this.imageSize,
-    required this.screenSize,
     required this.scanLinePosition,
     required this.statusMessage,
+    required this.isLowLight,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (detectedRect == null || imageSize == null) {
+    if (corners == null || corners!.length != 4 || imageSize == null) {
       _drawGuideLines(canvas, size);
       _drawStatusText(canvas, size,
           statusMessage.isEmpty ? "Mencari Dokumen..." : statusMessage, false);
@@ -720,49 +736,45 @@ class ScannerOverlayPainter extends CustomPainter {
       return;
     }
 
-    // Scale coordinates from camera resolution to screen resolution
-    final double scaleX = size.width / imageSize!.height;
-    final double scaleY = size.height / imageSize!.width;
+    // Scale coordinates from camera resolution (usually landscape) to screen resolution (portrait)
+    // imageSize: width (long), height (short)
+    final double scaleX = size.width / imageSize!.width;
+    final double scaleY = size.height / imageSize!.height;
 
-    final rect = Rect.fromLTRB(
-      detectedRect!.left * scaleX,
-      detectedRect!.top * scaleY,
-      detectedRect!.right * scaleX,
-      detectedRect!.bottom * scaleY,
-    );
+    final scaledPoints =
+        corners!.map((p) => Offset(p.x * scaleX, p.y * scaleY)).toList();
 
-    // Draw the detection box
+    // Draw the detection quad
     final paint = Paint()
-      ..color = AppColors.primary
+      ..color = Colors.greenAccent
       ..strokeWidth = 3
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round;
 
-    // Smart corners for detection
-    final cornerSize = 25.0;
     final path = Path()
-      ..moveTo(rect.left, rect.top + cornerSize)
-      ..lineTo(rect.left, rect.top)
-      ..lineTo(rect.left + cornerSize, rect.top)
-      ..moveTo(rect.right - cornerSize, rect.top)
-      ..lineTo(rect.right, rect.top)
-      ..lineTo(rect.right, rect.top + cornerSize)
-      ..moveTo(rect.right, rect.bottom - cornerSize)
-      ..lineTo(rect.right, rect.bottom)
-      ..lineTo(rect.right - cornerSize, rect.bottom)
-      ..moveTo(rect.left + cornerSize, rect.bottom)
-      ..lineTo(rect.left, rect.bottom)
-      ..lineTo(rect.left, rect.bottom - cornerSize);
+      ..moveTo(scaledPoints[0].dx, scaledPoints[0].dy)
+      ..lineTo(scaledPoints[1].dx, scaledPoints[1].dy)
+      ..lineTo(scaledPoints[2].dx, scaledPoints[2].dy)
+      ..lineTo(scaledPoints[3].dx, scaledPoints[3].dy)
+      ..close();
 
     canvas.drawPath(path, paint);
 
-    // Dynamic Fill pulse
+    // Semi-transparent overlay inside the quad
     final fillPaint = Paint()
-      ..color = AppColors.primary.withValues(alpha: 0.15)
+      ..color = Colors.greenAccent.withValues(alpha: 0.15)
       ..style = PaintingStyle.fill;
-    canvas.drawRect(rect, fillPaint);
+    canvas.drawPath(path, fillPaint);
 
     _drawStatusText(canvas, size, statusMessage, true);
+
+    // Derive a bounding box for scanning beam
+    final double minX = scaledPoints.map((p) => p.dx).reduce(math.min);
+    final double maxX = scaledPoints.map((p) => p.dx).reduce(math.max);
+    final double minY = scaledPoints.map((p) => p.dy).reduce(math.min);
+    final double maxY = scaledPoints.map((p) => p.dy).reduce(math.max);
+    final rect = Rect.fromLTRB(minX, minY, maxX, maxY);
+
     _drawScanningBeam(canvas, size, rect);
   }
 
